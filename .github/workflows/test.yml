@@ -34,7 +34,7 @@ jobs:
         with:
           repository: egao1980/process-protocol
           path: _deps/process-protocol
-          ref: cursor/wave1-3b01
+          ref: main
 
       - uses: oras-project/setup-oras@v2
         with:
