@@ -14,7 +14,8 @@
     (ok (= 1 code))))
 
 (deftest launch-wait
-  (let ((h (process-protocol:launch '("echo" "x"))))
+  ;; Use sleep so the child is still alive when we probe (echo races on fast CI).
+  (let ((h (process-protocol:launch '("sleep" "2"))))
     (ok (process-protocol:alive-p h))
     (ok (zerop (process-protocol:wait h)))
     (ng (process-protocol:alive-p h))))
