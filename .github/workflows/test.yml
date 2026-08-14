@@ -28,12 +28,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/checkout@v5
-        with:
-          repository: egao1980/process-protocol
-          path: _deps/process-protocol
-          ref: main
-
       - uses: egao1980/cl-repository/.github/actions/setup-client@main
 
       - name: Install Roswell (Unix)
@@ -62,11 +56,11 @@ jobs:
       - name: cl-repo install deps
         shell: bash
         run: |
-          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/_deps/process-protocol//:$(pwd)/${CL_REPOSITORY_CLIENT_DIR}//:"
+          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/${CL_REPOSITORY_CLIENT_DIR}//:"
           ros -l scripts/ci-install.lisp -q
 
       - name: Test
         shell: bash
         run: |
-          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/_deps/process-protocol//:$(pwd)/${CL_REPOSITORY_CLIENT_DIR}//:"
+          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/${CL_REPOSITORY_CLIENT_DIR}//:"
           ros -l scripts/ci-test.lisp -q
