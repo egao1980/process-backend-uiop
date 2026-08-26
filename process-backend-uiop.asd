@@ -4,7 +4,7 @@
   :author "egao1980"
   :license "MIT"
   :depends-on ("process-protocol" "babel")
-  :properties (:cl-repo (:ci (:sources (("babel" :ql) ("rove" :ql)))))
+
   :serial t
   :pathname "src"
   :components ((:file "package")
