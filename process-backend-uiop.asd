@@ -1,9 +1,9 @@
 (defsystem "process-backend-uiop"
-  :version "0.1.0"
+  :version "0.2.0"
   :description "UIOP backend for process-protocol"
   :author "egao1980"
   :license "MIT"
-  :depends-on ("process-protocol" "babel")
+  :depends-on ((:version "process-protocol" "0.3.0") "babel")
 
   :serial t
   :pathname "src"

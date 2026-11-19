@@ -10,7 +10,24 @@
 
 (defclass uiop-process-handle (process-protocol:process-handle)
   ((info :initarg :info :reader handle-info)
+   (command :initarg :command :initform nil :reader handle-command)
    (exit-code :initform nil :accessor handle-exit-code%)))
+
+(deftype octets () '(vector (unsigned-byte 8)))
+
+(defun %empty-octets ()
+  (make-array 0 :element-type '(unsigned-byte 8)))
+
+(defun %encoding (external-format)
+  "Babel encoding name for EXTERNAL-FORMAT (a keyword, or a list headed by one)."
+  (if (consp external-format) (first external-format) external-format))
+
+(defun %wrap (command message cause)
+  (error 'process-protocol:process-error
+         :command command :cause cause
+         :message (format nil "~a: ~a" message cause)))
+
+;;; Command + environment
 
 (defun %normalize-command (command shell)
   (cond
@@ -23,65 +40,218 @@
        (list command)
        (string
         (error 'process-protocol:process-error
+               :command command
                :message "string command requires :shell t"))))))
 
-(defun %octets (string)
-  (if (and string (plusp (length string)))
-      (babel:string-to-octets string :encoding :utf-8)
-      (make-array 0 :element-type '(unsigned-byte 8))))
+(defun %inherited-environment ()
+  "The parent environment as \"NAME=VALUE\" strings, or :UNSUPPORTED."
+  (let ((environ #+sbcl (find-symbol "POSIX-ENVIRON" "SB-EXT") #-sbcl nil))
+    (if (and environ (fboundp environ))
+        (funcall environ)
+        :unsupported)))
 
-(defun %input-arg (input)
-  (cond
-    ((null input) nil)
-    ((stringp input) input)
-    ((typep input '(vector (unsigned-byte 8)))
-     (babel:octets-to-string input :encoding :utf-8))
-    ((streamp input) input)
-    (t input)))
+(defun %entry-name (entry)
+  (if (consp entry)
+      (car entry)
+      (subseq entry 0 (or (position #\= entry :start (min 1 (length entry)))
+                          (length entry)))))
 
-(defmethod process-protocol:backend-run
-    ((backend uiop-process-backend) command
-     &key input output error directory env timeout discard-stderr shell)
-  (declare (ignore backend output error timeout))
+(defun %env-wrapper (env env-mode)
+  "env(1) argv prefix giving the child ENV / ENV-MODE (Unix, no environ access)."
+  (let* ((entries (process-protocol:merge-environment env :mode :replace
+                                                          :case-insensitive nil))
+         (unsets (remove-if (lambda (name) (assoc name entries :test #'string=))
+                            (remove-duplicates (mapcar #'%entry-name env) :test #'string=))))
+    (append (list "/usr/bin/env")
+            (if (eq env-mode :replace)
+                (list "-i")
+                (loop for name in unsets append (list "-u" name)))
+            (process-protocol:environment-strings entries))))
+
+(defun %command-and-env (command shell env env-mode)
+  "→ (values uiop-command extra-launch-keys)."
+  (check-type env-mode (member :merge :replace))
   (let ((cmd (%normalize-command command shell)))
-    (handler-case
-        (multiple-value-bind (out err code)
-            (apply #'uiop:run-program cmd
-                   (append
-                    (list :ignore-error-status t
-                          :output '(:string :stripped nil)
-                          :error-output (if discard-stderr
-                                           nil
-                                           '(:string :stripped nil))
-                          :input (%input-arg input)
-                          :force-shell (and shell t))
-                    (when directory (list :directory directory))
-                    (when env (list :environment env))))
-          (values code (%octets (or out "")) (%octets (or err ""))))
-      (error (c)
-        (error 'process-protocol:process-error
-               :message (format nil "~a" c))))))
+    (if (and (null env) (eq env-mode :merge))
+        (values cmd '())
+        (let ((base (%inherited-environment)))
+          (cond
+            ((listp base)
+             (values cmd
+                     (list :environment
+                           (process-protocol:environment-strings
+                            (process-protocol:merge-environment env :base base :mode env-mode)))))
+            ((process-protocol:windows-p)
+             (error 'process-protocol:process-error
+                    :command command
+                    :message (format nil ":env is not supported by this backend on ~a / Windows"
+                                     (lisp-implementation-type))))
+            (t
+             (values (append (%env-wrapper env env-mode)
+                             (if (stringp cmd) (list "/bin/sh" "-c" cmd) cmd))
+                     '())))))))
 
-(defmethod process-protocol:backend-launch
-    ((backend uiop-process-backend) command
-     &key input output error directory env shell)
-  (declare (ignore backend))
-  (let* ((cmd (%normalize-command command shell))
-         (info (apply #'uiop:launch-program cmd
-                      (append
-                       (list :input (or input :stream)
-                             :output (or output :stream)
-                             :error-output (or error :stream)
-                             :force-shell (and shell t))
-                       (when directory (list :directory directory))
-                       (when env (list :environment env))))))
-    (make-instance 'uiop-process-handle :info info)))
+;;; Files
 
-(defmethod process-protocol:process-wait ((handle uiop-process-handle) &key timeout)
-  (declare (ignore timeout))
+(defun %temp-file (prefix)
+  (uiop:with-temporary-file (:pathname p :prefix prefix :keep t)
+    p))
+
+(defun %write-octets (octets path)
+  (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
+                          :if-exists :supersede)
+    (write-sequence octets s))
+  path)
+
+(defun %read-octets (path)
+  (with-open-file (s path :element-type '(unsigned-byte 8))
+    (let* ((v (make-array (file-length s) :element-type '(unsigned-byte 8)))
+           (n (read-sequence v s)))
+      (if (= n (length v)) v (subseq v 0 n)))))
+
+(defun %stream-octets (stream encoding)
+  (if (subtypep (stream-element-type stream) '(unsigned-byte 8))
+      (let ((out (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+            (buf (make-array 65536 :element-type '(unsigned-byte 8))))
+        (loop for n = (read-sequence buf stream)
+              while (plusp n)
+              do (loop for i below n do (vector-push-extend (aref buf i) out)))
+        (coerce out '(simple-array (unsigned-byte 8) (*))))
+      (babel:string-to-octets (uiop:slurp-stream-string stream) :encoding encoding)))
+
+(defun %input-file (input encoding temps)
+  "INPUT as a UIOP :INPUT argument. String / octets / stream content goes
+through a temp file (pushed on the TEMPS cell) so nothing is decoded."
+  (flet ((temp (octets)
+           (let ((p (%temp-file "process-in")))
+             (push p (car temps))
+             (%write-octets octets p))))
+    (typecase input
+      (null nil)
+      (string (temp (babel:string-to-octets input :encoding encoding)))
+      (octets (temp input))
+      (stream (temp (%stream-octets input encoding)))
+      (t input))))
+
+(defun %capture (path kind encoding command)
+  (ecase kind
+    ((nil) (%empty-octets))
+    (:octets (%read-octets path))
+    (:string
+     (let ((octets (%read-octets path)))
+       (handler-case (babel:octets-to-string octets :encoding encoding)
+         (babel-encodings:character-decoding-error (c)
+           (%wrap command (format nil "cannot decode output as ~a" encoding) c)))))))
+
+;;; Waiting
+
+(defun %reap (handle)
   (let ((code (uiop:wait-process (handle-info handle))))
     (setf (handle-exit-code% handle) code)
     code))
+
+(defun %wait-until (handle seconds)
+  "Poll HANDLE for SECONDS. → exit code, or NIL when still running."
+  (let ((info (handle-info handle))
+        (deadline (+ (get-internal-real-time)
+                     (ceiling (* seconds internal-time-units-per-second))))
+        (pause 0.001))
+    (loop
+      (unless (uiop:process-alive-p info)
+        (return (%reap handle)))
+      (when (>= (get-internal-real-time) deadline)
+        (return nil))
+      (sleep pause)
+      (setf pause (min 0.05 (* pause 2))))))
+
+(defun %wait (handle timeout)
+  "Exit code of HANDLE. With TIMEOUT, PROCESS-TIMEOUT-ERROR + CONTINUE each time it expires."
+  (if (null timeout)
+      (%reap handle)
+      (loop
+        (let ((code (%wait-until handle timeout)))
+          (when code (return code))
+          (restart-case
+              (error 'process-protocol:process-timeout-error
+                     :command (handle-command handle) :timeout timeout :process handle)
+            (continue ()
+              :report (lambda (s) (format s "Wait another ~a seconds for the process." timeout))
+              nil))))))
+
+(defun %kill-and-reap (handle)
+  (let ((info (handle-info handle)))
+    (when (uiop:process-alive-p info)
+      (uiop:terminate-process info :urgent t))
+    (%reap handle)))
+
+;;; Protocol methods
+
+(defmethod process-protocol:backend-run
+    ((backend uiop-process-backend) command
+     &key input (output :octets) (error-output :octets error-output-p) (error nil error-p)
+       directory env (env-mode :merge) timeout discard-stderr shell
+       (external-format :utf-8))
+  (declare (ignore backend))
+  (check-type timeout (or null (real 0)))
+  (let* ((encoding (%encoding external-format))
+         (out-kind (process-protocol:normalize-capture output :output))
+         (err-kind (cond (discard-stderr nil)
+                         (error-output-p (process-protocol:normalize-capture error-output :error-output))
+                         (error-p (process-protocol:normalize-capture error :error))
+                         (t :octets)))
+         (temps (list '()))
+         (handle nil)
+         (finished nil))
+    (multiple-value-bind (cmd env-keys) (%command-and-env command shell env env-mode)
+      (unwind-protect
+           (let ((in (%input-file input encoding temps))
+                 (out-file (when out-kind (car (push (%temp-file "process-out") (car temps)))))
+                 (err-file (when err-kind (car (push (%temp-file "process-err") (car temps))))))
+             (setf handle
+                   (make-instance
+                    'uiop-process-handle
+                    :command command
+                    :info (handler-case
+                              (apply #'uiop:launch-program cmd
+                                     :input in :output out-file :error-output err-file
+                                     (append (when directory (list :directory directory))
+                                             env-keys))
+                            (error (c) (%wrap command "cannot run program" c)))))
+             (let ((code (%wait handle timeout)))
+               (setf finished t)
+               (values code
+                       (%capture out-file out-kind encoding command)
+                       (%capture err-file err-kind encoding command))))
+        (when (and handle (not finished))
+          (%kill-and-reap handle))
+        (mapc #'uiop:delete-file-if-exists (car temps))))))
+
+(defmethod process-protocol:backend-launch
+    ((backend uiop-process-backend) command
+     &key input output (error-output nil error-output-p) error directory env
+       (env-mode :merge) shell element-type (external-format :utf-8))
+  (declare (ignore backend))
+  (let ((element-type (process-protocol:normalize-element-type element-type))
+        (error-output (if error-output-p error-output error)))
+    (multiple-value-bind (cmd env-keys) (%command-and-env command shell env env-mode)
+      (make-instance
+       'uiop-process-handle
+       :command command
+       :info (handler-case
+                 (apply #'uiop:launch-program cmd
+                        :input (or input :stream)
+                        :output (or output :stream)
+                        :error-output (or error-output :stream)
+                        :element-type element-type
+                        :external-format external-format
+                        (append (when directory (list :directory directory))
+                                env-keys))
+               (error (c) (%wrap command "cannot run program" c)))))))
+
+(defmethod process-protocol:process-wait ((handle uiop-process-handle) &key timeout)
+  (check-type timeout (or null (real 0)))
+  (or (handle-exit-code% handle)
+      (%wait handle timeout)))
 
 (defmethod process-protocol:process-kill ((handle uiop-process-handle) &key force)
   (uiop:terminate-process (handle-info handle) :urgent force)
@@ -102,7 +272,6 @@
 (defmethod process-protocol:process-exit-code ((handle uiop-process-handle))
   (or (handle-exit-code% handle)
       (unless (uiop:process-alive-p (handle-info handle))
-        (setf (handle-exit-code% handle)
-              (uiop:wait-process (handle-info handle))))))
+        (%reap handle))))
 
 (use-uiop-process-backend)
