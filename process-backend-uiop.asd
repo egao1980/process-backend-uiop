@@ -1,9 +1,9 @@
 (defsystem "process-backend-uiop"
-  :version "0.2.0"
+  :version "0.3.0"
   :description "UIOP backend for process-protocol"
   :author "egao1980"
   :license "MIT"
-  :depends-on ((:version "process-protocol" "0.3.0") "babel")
+  :depends-on ((:version "process-protocol" "0.4.0") "babel")
 
   :serial t
   :pathname "src"
@@ -16,7 +16,8 @@
   :pathname "tests"
   :serial t
   :components ((:file "package")
-               (:file "backend-test"))
+               (:file "backend-test")
+               (:file "tree-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))

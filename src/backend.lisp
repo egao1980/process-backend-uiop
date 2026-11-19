@@ -11,6 +11,9 @@
 (defclass uiop-process-handle (process-protocol:process-handle)
   ((info :initarg :info :reader handle-info)
    (command :initarg :command :initform nil :reader handle-command)
+   (pid :initarg :pid :initform nil :reader handle-pid)
+   (process-group :initarg :process-group :initform nil :reader handle-process-group-p
+                  :documentation "T when launched with :PROCESS-GROUP T (Unix: PID is the group id).")
    (exit-code :initform nil :accessor handle-exit-code%)))
 
 (deftype octets () '(vector (unsigned-byte 8)))
@@ -90,6 +93,85 @@
              (values (append (%env-wrapper env env-mode)
                              (if (stringp cmd) (list "/bin/sh" "-c" cmd) cmd))
                      '())))))))
+
+;;; Process groups (process-protocol 0.4.0)
+;;;
+;;; Unix (SBCL): SBCL's spawn() already makes the child a process-group leader
+;;; (setpgid) whenever stdin is not inherited from the parent; :PROCESS-GROUP T
+;;; refuses inherited stdin and checks getpgid(pid) = pid after the launch.
+;;; The tree kill is killpg(pid, SIGTERM | SIGKILL). Other Unix Lisps: no
+;;; :PROCESS-GROUP (their run-program does not promise a new group).
+;;; Windows: nothing to set up; the tree kill is taskkill /T /F /PID.
+
+(defun %group-supported-p ()
+  (or (process-protocol:windows-p)
+      #+sbcl t
+      #-sbcl nil))
+
+#+(and sbcl (not (or win32 windows)))
+(progn
+  (defun %getpgid (pid)
+    (sb-alien:alien-funcall
+     (sb-alien:extern-alien "getpgid" (function sb-alien:int sb-alien:int))
+     pid))
+
+  (defun %killpg (pgid signal)
+    "killpg(2). A group that no longer exists (ESRCH) is not an error."
+    (sb-alien:alien-funcall
+     (sb-alien:extern-alien "killpg" (function sb-alien:int sb-alien:int sb-alien:int))
+     pgid signal)))
+
+(defun %group-error (command message &optional handle)
+  (error 'process-protocol:process-group-error
+         :command command :process handle :message message))
+
+(defun %check-group-request (command input)
+  "Signal PROCESS-GROUP-ERROR when :PROCESS-GROUP T cannot be honoured."
+  (cond
+    ((not (%group-supported-p))
+     (%group-error command (format nil ":process-group t is not supported by this backend on ~a"
+                                   (lisp-implementation-type))))
+    ((and (not (process-protocol:windows-p))
+          (member input '(t :interactive)))
+     (%group-error command ":process-group t needs a non-inherited :input (SBCL keeps a child that shares the terminal's stdin in the parent's group)"))))
+
+(defun %make-handle (command info process-group)
+  "A handle for INFO. With PROCESS-GROUP on Unix, verify the child leads its group."
+  (let* ((pid (uiop:process-info-pid info))
+         (handle (make-instance 'uiop-process-handle
+                                :command command :info info :pid pid
+                                :process-group (and process-group t))))
+    #+(and sbcl (not (or win32 windows)))
+    (when process-group
+      (let ((pgid (if pid (%getpgid pid) -1)))
+        ;; -1: already gone (ESRCH); nothing escaped the group then.
+        (unless (or (= pgid -1) (eql pgid pid))
+          (%kill-child handle t)
+          (uiop:wait-process info)
+          (%group-error command (format nil "the child (pid ~a) is in process group ~a, not its own"
+                                        pid pgid)
+                        handle))))
+    handle))
+
+(defun %kill-child (handle force)
+  (uiop:terminate-process (handle-info handle) :urgent force))
+
+(defun %kill-tree (handle force)
+  "Signal HANDLE's whole tree. HANDLE was launched with :PROCESS-GROUP T."
+  (let ((pid (handle-pid handle)))
+    (cond
+      ((null pid) (%kill-child handle force))
+      ((process-protocol:windows-p)
+       ;; Parent pids are walked now: only while the child runs is its pid ours.
+       (when (uiop:process-alive-p (handle-info handle))
+         (uiop:run-program (list "taskkill" "/T" "/F" "/PID" (princ-to-string pid))
+                           :output nil :error-output nil :ignore-error-status t)))
+      (t
+       #+(and sbcl (not (or win32 windows)))
+       ;; The group outlives its leader while any member runs.
+       (%killpg pid (if force 9 15))
+       #-(and sbcl (not (or win32 windows)))
+       (%kill-child handle force)))))
 
 ;;; Files
 
@@ -179,9 +261,10 @@ through a temp file (pushed on the TEMPS cell) so nothing is decoded."
               nil))))))
 
 (defun %kill-and-reap (handle)
+  "Kill HANDLE (its tree when launched with :PROCESS-GROUP T) and reap it."
   (let ((info (handle-info handle)))
-    (when (uiop:process-alive-p info)
-      (uiop:terminate-process info :urgent t))
+    (cond ((handle-process-group-p handle) (%kill-tree handle t))
+          ((uiop:process-alive-p info) (%kill-child handle t)))
     (%reap handle)))
 
 ;;; Protocol methods
@@ -190,9 +273,10 @@ through a temp file (pushed on the TEMPS cell) so nothing is decoded."
     ((backend uiop-process-backend) command
      &key input (output :octets) (error-output :octets error-output-p) (error nil error-p)
        directory env (env-mode :merge) timeout discard-stderr shell
-       (external-format :utf-8))
+       (external-format :utf-8) process-group)
   (declare (ignore backend))
   (check-type timeout (or null (real 0)))
+  (when process-group (%check-group-request command input))
   (let* ((encoding (%encoding external-format))
          (out-kind (process-protocol:normalize-capture output :output))
          (err-kind (cond (discard-stderr nil)
@@ -208,15 +292,15 @@ through a temp file (pushed on the TEMPS cell) so nothing is decoded."
                  (out-file (when out-kind (car (push (%temp-file "process-out") (car temps)))))
                  (err-file (when err-kind (car (push (%temp-file "process-err") (car temps))))))
              (setf handle
-                   (make-instance
-                    'uiop-process-handle
-                    :command command
-                    :info (handler-case
-                              (apply #'uiop:launch-program cmd
-                                     :input in :output out-file :error-output err-file
-                                     (append (when directory (list :directory directory))
-                                             env-keys))
-                            (error (c) (%wrap command "cannot run program" c)))))
+                   (%make-handle
+                    command
+                    (handler-case
+                        (apply #'uiop:launch-program cmd
+                               :input in :output out-file :error-output err-file
+                               (append (when directory (list :directory directory))
+                                       env-keys))
+                      (error (c) (%wrap command "cannot run program" c)))
+                    process-group))
              (let ((code (%wait handle timeout)))
                (setf finished t)
                (values code
@@ -229,33 +313,55 @@ through a temp file (pushed on the TEMPS cell) so nothing is decoded."
 (defmethod process-protocol:backend-launch
     ((backend uiop-process-backend) command
      &key input output (error-output nil error-output-p) error directory env
-       (env-mode :merge) shell element-type (external-format :utf-8))
+       (env-mode :merge) shell element-type (external-format :utf-8) process-group)
   (declare (ignore backend))
+  (when process-group (%check-group-request command input))
   (let ((element-type (process-protocol:normalize-element-type element-type))
         (error-output (if error-output-p error-output error)))
     (multiple-value-bind (cmd env-keys) (%command-and-env command shell env env-mode)
-      (make-instance
-       'uiop-process-handle
-       :command command
-       :info (handler-case
-                 (apply #'uiop:launch-program cmd
-                        :input (or input :stream)
-                        :output (or output :stream)
-                        :error-output (or error-output :stream)
-                        :element-type element-type
-                        :external-format external-format
-                        (append (when directory (list :directory directory))
-                                env-keys))
-               (error (c) (%wrap command "cannot run program" c)))))))
+      (%make-handle
+       command
+       (handler-case
+           (apply #'uiop:launch-program cmd
+                  :input (or input :stream)
+                  :output (or output :stream)
+                  :error-output (or error-output :stream)
+                  :element-type element-type
+                  :external-format external-format
+                  (append (when directory (list :directory directory))
+                          env-keys))
+         (error (c) (%wrap command "cannot run program" c)))
+       process-group))))
 
 (defmethod process-protocol:process-wait ((handle uiop-process-handle) &key timeout)
   (check-type timeout (or null (real 0)))
   (or (handle-exit-code% handle)
       (%wait handle timeout)))
 
-(defmethod process-protocol:process-kill ((handle uiop-process-handle) &key force)
-  (uiop:terminate-process (handle-info handle) :urgent force)
+(defmethod process-protocol:process-kill ((handle uiop-process-handle) &key force tree)
+  (cond
+    ((not tree) (%kill-child handle force))
+    ((handle-process-group-p handle) (%kill-tree handle force))
+    (t
+     (restart-case
+         (error 'process-protocol:process-group-error
+                :command (handle-command handle) :process handle
+                :message "kill :tree t needs a handle launched with :process-group t")
+       (continue ()
+         :report "Kill the direct child only."
+         (%kill-child handle force)))))
   t)
+
+(defmethod process-protocol:process-pid ((handle uiop-process-handle))
+  (handle-pid handle))
+
+(defmethod process-protocol:backend-supports-p
+    ((backend uiop-process-backend) (capability (eql :pid)))
+  t)
+
+(defmethod process-protocol:backend-supports-p
+    ((backend uiop-process-backend) (capability (eql :process-group)))
+  (%group-supported-p))
 
 (defmethod process-protocol:process-alive-p ((handle uiop-process-handle))
   (uiop:process-alive-p (handle-info handle)))
