@@ -53,6 +53,13 @@ other Unix (kill -0 also succeeds on an unreaped zombie), tasklist on Windows."
       "sleep 100 & cat /proc/$!/winpid; sleep 100"
       "sleep 100 & echo $!; sleep 100"))
 
+(defun check-grandchild-pid (pid description)
+  "PID must be a positive integer. Windows: skip when the MSYS shell has no
+/proc/PID/winpid (the marker tests still cover the tree kill there)."
+  (if (or pid (not (windows-p)))
+      (ok (typep pid '(integer 1)) description)
+      (skip "no /proc/PID/winpid from this sh: Windows pid check skipped")))
+
 (defun shell-path (pathname)
   "PATHNAME as sh(1) sees it (forward slashes on Windows)."
   (substitute #\/ #\\ (uiop:native-namestring pathname)))
@@ -99,7 +106,7 @@ other Unix (kill -0 also succeeds on an unreaped zombie), tasklist on Windows."
       (unwind-protect
            (progn
              (ok (process-protocol:alive-p h))
-             (ok (typep grandchild '(integer 1)) "the shell printed the grandchild pid")
+             (check-grandchild-pid grandchild "the shell printed the grandchild pid")
              (when grandchild
                (ok (pid-alive-p grandchild) "grandchild runs before the kill"))
              (ok (eq t (process-protocol:kill h :tree t)))
@@ -188,7 +195,7 @@ other Unix (kill -0 also succeeds on an unreaped zombie), tasklist on Windows."
                   'process-protocol:process-timeout-error))
              (let ((grandchild (and (probe-file pidfile)
                                     (with-open-file (s pidfile) (integer-line s)))))
-               (ok (typep grandchild '(integer 1)) "the shell wrote the grandchild pid")
+               (check-grandchild-pid grandchild "the shell wrote the grandchild pid")
                (when grandchild
                  (ok (pid-gone-p grandchild) "timeout killed the grandchild")))
              (sleep 3)
