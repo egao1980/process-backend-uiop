@@ -60,6 +60,14 @@ other Unix (kill -0 also succeeds on an unreaped zombie), tasklist on Windows."
       (ok (typep pid '(integer 1)) description)
       (skip "no /proc/PID/winpid from this sh: Windows pid check skipped")))
 
+(defun check-grandchild-gone (pid description)
+  "PID is gone within 5 s. Windows: skipped — an MSYS grandchild's
+/proc/PID/winpid stays listed by tasklist after taskkill /T although the
+marker tests show the tree is stopped (egao1980/process-backend-uiop#13)."
+  (if (windows-p)
+      (skip "Windows pid liveness after a tree kill: process-backend-uiop#13")
+      (ok (pid-gone-p pid) description)))
+
 (defun shell-path (pathname)
   "PATHNAME as sh(1) sees it (forward slashes on Windows)."
   (substitute #\/ #\\ (uiop:native-namestring pathname)))
@@ -111,7 +119,7 @@ other Unix (kill -0 also succeeds on an unreaped zombie), tasklist on Windows."
                (ok (pid-alive-p grandchild) "grandchild runs before the kill"))
              (ok (eq t (process-protocol:kill h :tree t)))
              (when grandchild
-               (ok (pid-gone-p grandchild) "grandchild is gone after kill :tree t"))
+               (check-grandchild-gone grandchild "grandchild is gone after kill :tree t"))
              (reap h)
              (ng (process-protocol:alive-p h)))
         (when (process-protocol:alive-p h)
@@ -197,7 +205,7 @@ other Unix (kill -0 also succeeds on an unreaped zombie), tasklist on Windows."
                                     (with-open-file (s pidfile) (integer-line s)))))
                (check-grandchild-pid grandchild "the shell wrote the grandchild pid")
                (when grandchild
-                 (ok (pid-gone-p grandchild) "timeout killed the grandchild")))
+                 (check-grandchild-gone grandchild "timeout killed the grandchild")))
              (sleep 3)
              (ng (probe-file marker) "the timed-out tree did not write the marker"))
         (uiop:delete-file-if-exists marker)
