@@ -61,11 +61,11 @@ other Unix (kill -0 also succeeds on an unreaped zombie), tasklist on Windows."
       (skip "no /proc/PID/winpid from this sh: Windows pid check skipped")))
 
 (defun check-grandchild-gone (pid description)
-  "PID is gone within 5 s. Windows: skipped — an MSYS grandchild's
-/proc/PID/winpid stays listed by tasklist after taskkill /T although the
-marker tests show the tree is stopped (egao1980/process-backend-uiop#13)."
-  (if (windows-p)
-      (skip "Windows pid liveness after a tree kill: process-backend-uiop#13")
+  "PID is gone within 5 s. Windows without SBCL: skipped — the taskkill /T
+fallback misses an MSYS grandchild whose Windows parent pid is gone
+(egao1980/process-backend-uiop#13); SBCL uses a job object instead."
+  (if (and (windows-p) #+sbcl nil #-sbcl t)
+      (skip "Windows taskkill /T fallback: process-backend-uiop#13")
       (ok (pid-gone-p pid) description)))
 
 (defun shell-path (pathname)
@@ -144,9 +144,10 @@ marker tests show the tree is stopped (egao1980/process-backend-uiop#13)."
              (ng (probe-file marker) "the grandchild did not write the marker"))
         (uiop:delete-file-if-exists marker)))))
 
-#-(or win32 windows)
+#-(and (or win32 windows) (not sbcl))
 (deftest plain-kill-leaves-grandchild
   ;; Control: without :tree only the shell dies — the gap #9 closes.
+  ;; Windows (SBCL): the job object outlives the shell, like a Unix group.
   (with-tree-kill ("sh" "sleep")
     (let* ((h (process-protocol:launch (list "sh" "-c" (grandchild-pid-script))
                                        :process-group t))
