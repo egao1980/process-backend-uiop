@@ -14,6 +14,8 @@
    (pid :initarg :pid :initform nil :reader handle-pid)
    (process-group :initarg :process-group :initform nil :reader handle-process-group-p
                   :documentation "T when launched with :PROCESS-GROUP T (Unix: PID is the group id).")
+   (job :initarg :job :initform nil :reader handle-job
+        :documentation "Windows (SBCL): the job object holding the child's tree, or NIL.")
    (exit-code :initform nil :accessor handle-exit-code%)))
 
 (deftype octets () '(vector (unsigned-byte 8)))
@@ -101,7 +103,14 @@
 ;;; refuses inherited stdin and checks getpgid(pid) = pid after the launch.
 ;;; The tree kill is killpg(pid, SIGTERM | SIGKILL). Other Unix Lisps: no
 ;;; :PROCESS-GROUP (their run-program does not promise a new group).
-;;; Windows: nothing to set up; the tree kill is taskkill /T /F /PID.
+;;; Windows (SBCL): right after CreateProcess the child is put in a new job
+;;; object (CreateJobObjectW + AssignProcessToJobObject, kernel32 through
+;;; sb-alien: no native library). Its descendants inherit the job, so the
+;;; tree kill is TerminateJobObject — also after the child itself exited.
+;;; taskkill /T is not enough: an MSYS / Cygwin fork+exec (Git for Windows sh)
+;;; leaves the exec'd program with a Windows parent pid that no longer exists,
+;;; so walking parent pids misses it (egao1980/process-backend-uiop#13).
+;;; Other Windows Lisps, or a failed assignment: taskkill /T /F /PID.
 
 (defun %group-supported-p ()
   (or (process-protocol:windows-p)
@@ -120,6 +129,65 @@
     (sb-alien:alien-funcall
      (sb-alien:extern-alien "killpg" (function sb-alien:int sb-alien:int sb-alien:int))
      pgid signal)))
+
+#+(and sbcl (or win32 windows))
+(progn
+  (defun %close-handle (handle)
+    (sb-alien:alien-funcall
+     (sb-alien:extern-alien "CloseHandle" (function sb-alien:int sb-alien:system-area-pointer))
+     handle))
+
+  (defun %null-sap-p (sap)
+    (zerop (sb-sys:sap-int sap)))
+
+  (defun %job-for-pid (pid)
+    "A new job object holding process PID, or NIL when either call fails."
+    (let ((job (sb-alien:alien-funcall
+                (sb-alien:extern-alien "CreateJobObjectW"
+                                       (function sb-alien:system-area-pointer
+                                                 sb-alien:system-area-pointer
+                                                 sb-alien:system-area-pointer))
+                (sb-sys:int-sap 0) (sb-sys:int-sap 0))))
+      (unless (%null-sap-p job)
+        ;; PROCESS_SET_QUOTA | PROCESS_TERMINATE: what AssignProcessToJobObject needs.
+        (let* ((process (sb-alien:alien-funcall
+                         (sb-alien:extern-alien "OpenProcess"
+                                                (function sb-alien:system-area-pointer
+                                                          (sb-alien:unsigned 32)
+                                                          sb-alien:int
+                                                          (sb-alien:unsigned 32)))
+                         #x0101 0 pid))
+               (assigned (and (not (%null-sap-p process))
+                              (prog1 (/= 0 (sb-alien:alien-funcall
+                                            (sb-alien:extern-alien
+                                             "AssignProcessToJobObject"
+                                             (function sb-alien:int
+                                                       sb-alien:system-area-pointer
+                                                       sb-alien:system-area-pointer))
+                                            job process))
+                                (%close-handle process)))))
+          (if assigned
+              job
+              (progn (%close-handle job) nil))))))
+
+  (defun %terminate-job (job)
+    "TerminateJobObject(JOB, 1): every process in the job exits with code 1."
+    (sb-alien:alien-funcall
+     (sb-alien:extern-alien "TerminateJobObject"
+                            (function sb-alien:int sb-alien:system-area-pointer
+                                      (sb-alien:unsigned 32)))
+     job 1)))
+
+(defun %attach-job (handle)
+  "Windows (SBCL): put HANDLE's child in a new job object; the handle's
+finalizer closes the job handle. Elsewhere, or when that fails: HANDLE as is."
+  #+(and sbcl (or win32 windows))
+  (let* ((pid (handle-pid handle))
+         (job (and pid (%job-for-pid pid))))
+    (when job
+      (setf (slot-value handle 'job) job)
+      (sb-ext:finalize handle (lambda () (%close-handle job)) :dont-save t)))
+  handle)
 
 (defun %group-error (command message &optional handle)
   (error 'process-protocol:process-group-error
@@ -151,6 +219,8 @@
           (%group-error command (format nil "the child (pid ~a) is in process group ~a, not its own"
                                         pid pgid)
                         handle))))
+    (when (and process-group (process-protocol:windows-p))
+      (%attach-job handle))
     handle))
 
 (defun %kill-child (handle force)
@@ -161,6 +231,9 @@
   (let ((pid (handle-pid handle)))
     (cond
       ((null pid) (%kill-child handle force))
+      ((and (process-protocol:windows-p) (handle-job handle))
+       ;; The job outlives the child while any descendant runs.
+       #+(and sbcl (or win32 windows)) (%terminate-job (handle-job handle)))
       ((process-protocol:windows-p)
        ;; Parent pids are walked now: only while the child runs is its pid ours.
        (when (uiop:process-alive-p (handle-info handle))
