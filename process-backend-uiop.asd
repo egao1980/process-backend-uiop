@@ -1,5 +1,5 @@
 (defsystem "process-backend-uiop"
-  :version "0.3.1"
+  :version "0.3.2"
   :description "UIOP backend for process-protocol"
   :author "egao1980"
   :license "MIT"
