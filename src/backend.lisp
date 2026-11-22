@@ -33,6 +33,67 @@
          :message (format nil "~a: ~a" message cause)))
 
 ;;; Command + environment
+;;;
+;;; Windows: UIOP gives a list command C-runtime quoting (" → \"), which is
+;;; right for ordinary programs, but cmd.exe does not parse its command line
+;;; that way: after /C (or /K) it takes the rest of the line as written. So a
+;;; cmd.exe argv with /C or /K becomes the line
+;;;   <program> <switches, C-runtime quoted> "<arguments after /C, space-joined>"
+;;; passed to CreateProcess unescaped. That is the form /S expects (it strips
+;;; the outer pair; without /S cmd strips the same pair whenever the line holds
+;;; more than two quotes or is not one executable name). Node/libuv and Rust std
+;;; special-case cmd.exe the same way (egao1980/process-backend-uiop#17).
+;;; UIOP takes the unescaped line as a dotted command (PROGRAM . "ARGUMENTS"),
+;;; the form it uses itself for string commands.
+
+(defun %cmd-program-p (program)
+  "PROGRAM (a string) names cmd.exe: cmd or cmd.exe, bare or as a path's last
+component, any case."
+  (let ((name (subseq program (1+ (or (position-if (lambda (c) (find c "/\\")) program
+                                                   :from-end t)
+                                      -1)))))
+    (or (string-equal name "cmd") (string-equal name "cmd.exe"))))
+
+(defun %windows-quote (arg)
+  "ARG quoted for the C runtime's command-line parser (unchanged when it needs none)."
+  (if (and (plusp (length arg))
+           (not (find-if (lambda (c) (find c '(#\Space #\Tab #\Newline #\"))) arg)))
+      arg
+      (with-output-to-string (s)
+        (write-char #\" s)
+        (let ((slashes 0))
+          (loop for c across arg
+                do (cond ((char= c #\\) (incf slashes))
+                         ((char= c #\")
+                          (loop repeat (1+ (* 2 slashes)) do (write-char #\\ s))
+                          (setf slashes 0))
+                         (t (setf slashes 0)))
+                   (write-char c s))
+          (loop repeat slashes do (write-char #\\ s)))
+        (write-char #\" s))))
+
+(defun %windows-cmd-command (command)
+  "COMMAND (a list argv) in the form UIOP should launch on Windows: for cmd.exe
+with a /C or /K switch, (PROGRAM . LINE) where LINE is the switches up to it
+\(C-runtime quoted) and the remaining arguments, space-joined, in one pair of
+quotes, verbatim; any other COMMAND unchanged. (A PROGRAM containing a space or
+a quote is left unchanged too: CreateProcess would get it unquoted.)"
+  (let* ((program (first command))
+         (args (rest command))
+         (switch (position-if (lambda (a)
+                                (and (stringp a)
+                                     (or (string-equal a "/c") (string-equal a "/k"))))
+                              args)))
+    (if (and (stringp program)
+             (every #'stringp args)
+             switch
+             (%cmd-program-p program)
+             (not (find-if (lambda (c) (find c '(#\Space #\Tab #\"))) program)))
+        (cons program
+              (format nil "~{~a ~}\"~{~a~^ ~}\""
+                      (mapcar #'%windows-quote (subseq args 0 (1+ switch)))
+                      (subseq args (1+ switch))))
+        command)))
 
 (defun %normalize-command (command shell)
   (cond
@@ -42,7 +103,10 @@
        (list (format nil "~{~a~^ ~}" command))))
     (t
      (etypecase command
-       (list command)
+       (list (if (and (process-protocol:windows-p)
+                      #+(or sbcl ecl clasp) t #-(or sbcl ecl clasp) nil)
+                 (%windows-cmd-command command)
+                 command))
        (string
         (error 'process-protocol:process-error
                :command command

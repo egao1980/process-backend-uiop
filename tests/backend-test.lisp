@@ -304,3 +304,39 @@ under bash."
       (ok (zerop code))
       (ok (= (* 2000 71) (length out)))
       (ok (= (* 2000 72) (length err))))))
+
+;;; Windows: cmd.exe gets its command line verbatim (#17)
+
+(deftest windows-cmd-command-line
+  (let ((f #'process-backend-uiop::%windows-cmd-command))
+    (ok (equal '("cmd.exe" . "/d /s /c \"echo ran> \"C:\\x y\\ran.txt\"\"")
+               (funcall f '("cmd.exe" "/d" "/s" "/c" "echo ran> \"C:\\x y\\ran.txt\"")))
+        "the arguments after /c, verbatim, in one pair of quotes")
+    (ok (equal '("C:\\Windows\\system32\\CMD.EXE" . "/C \"dir /b\"")
+               (funcall f '("C:\\Windows\\system32\\CMD.EXE" "/C" "dir" "/b")))
+        "a path, any case; several arguments are space-joined")
+    (ok (equal '("cmd" . "/k \"\"") (funcall f '("cmd" "/k"))))
+    (ok (equal '("cmd.exe" "/d") (funcall f '("cmd.exe" "/d"))) "no /c: unchanged")
+    (ok (equal '("sh" "-c" "echo \"x\"") (funcall f '("sh" "-c" "echo \"x\"")))
+        "other programs: unchanged")
+    (ok (equal '("C:\\a b\\cmd.exe" "/c" "x") (funcall f '("C:\\a b\\cmd.exe" "/c" "x")))
+        "a program with a space: unchanged")))
+
+(deftest windows-cmd-quoted-redirect
+  (if (not (windows-p))
+      (skip "Windows only")
+      (let* ((dir (uiop:ensure-directory-pathname
+                   (merge-pathnames (format nil "pbu cmd ~36R" (random (expt 36 6)))
+                                    (uiop:temporary-directory))))
+             (file (merge-pathnames "ran.txt" dir)))
+        (ensure-directories-exist dir)
+        (unwind-protect
+             (multiple-value-bind (code out)
+                 (process-protocol:run
+                  (list "cmd.exe" "/d" "/s" "/c"
+                        (format nil "echo ran> \"~a\" && echo \"quoted & kept\""
+                                (uiop:native-namestring file))))
+               (ok (eql 0 code) (utf8 out))
+               (ok (uiop:file-exists-p file) "the quoted redirect target was written")
+               (ok (search "\"quoted & kept\"" (utf8 out)) "quotes reach cmd as written"))
+          (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
