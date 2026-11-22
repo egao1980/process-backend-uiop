@@ -223,6 +223,104 @@ finalizer closes the job handle. Elsewhere, or when that fails: HANDLE as is."
       (%attach-job handle))
     handle))
 
+;;; This image's standard handles (Windows)
+;;;
+;;; SBCL starts a child with CreateProcess bInheritHandles = TRUE whenever a
+;;; stream is redirected, and that hands over EVERY inheritable handle, not
+;;; only the child's stdio. This image's own stdin / stdout / stderr are
+;;; inheritable when its parent made them so — the pipes of a JSON-RPC client
+;;; that launched it, say. A child that outlives this image then keeps the
+;;; parent's pipes open: the parent's read of our stdout sees no EOF until
+;;; that grandchild exits (a crashed cl-stack-code --rpc child's shell jobs
+;;; held close-rpc-client for 5 minutes, then had exited before the crash
+;;; sweep looked: egao1980/supervisor-protocol#9). Unix is not affected
+;;; (SBCL's spawn closes every other descriptor in the child).
+;;; So, on Windows (SBCL), each launch first marks the standard handles that
+;;; are pipes or files and that the child does not take as its own stdio
+;;; (T / :INTERACTIVE; a stream argument keeps all three) not inheritable,
+;;; and restores them after CreateProcess, under one lock. Console handles
+;;; are left alone.
+
+(defun %std-spec-inherited-p (spec)
+  "True when SPEC (an :input / :output / :error-output argument) hands the
+child this image's own standard stream."
+  (or (eq spec t) (eq spec :interactive)))
+
+#+(and sbcl (or win32 windows))
+(progn
+  (defvar *std-handle-lock* (sb-thread:make-mutex :name "process-backend-uiop std handles"))
+
+  (defconstant +handle-flag-inherit+ 1)
+
+  (defun %std-handle (which)
+    "GetStdHandle for WHICH (0 stdin, 1 stdout, 2 stderr) → its address, or NIL."
+    (let* ((id (ecase which (0 #xFFFFFFF6) (1 #xFFFFFFF5) (2 #xFFFFFFF4)))
+           (sap (sb-alien:alien-funcall
+                 (sb-alien:extern-alien "GetStdHandle"
+                                        (function sb-alien:system-area-pointer
+                                                  (sb-alien:unsigned 32)))
+                 id))
+           (n (sb-sys:sap-int sap)))
+      (and (/= n 0) (/= n (ldb (byte 64 0) -1)) (/= n (ldb (byte 32 0) -1)) n)))
+
+  (defun %file-type (handle)
+    "GetFileType: 1 disk, 2 character (console), 3 pipe, 0 unknown."
+    (sb-alien:alien-funcall
+     (sb-alien:extern-alien "GetFileType"
+                            (function (sb-alien:unsigned 32) sb-alien:system-area-pointer))
+     (sb-sys:int-sap handle)))
+
+  (defun %inheritable-p (handle)
+    (sb-alien:with-alien ((flags (sb-alien:unsigned 32) 0))
+      (and (/= 0 (sb-alien:alien-funcall
+                  (sb-alien:extern-alien "GetHandleInformation"
+                                         (function sb-alien:int sb-alien:system-area-pointer
+                                                   (* (sb-alien:unsigned 32))))
+                  (sb-sys:int-sap handle) (sb-alien:addr flags)))
+           (logtest flags +handle-flag-inherit+))))
+
+  (defun %set-inheritable (handle inheritable)
+    "SetHandleInformation HANDLE_FLAG_INHERIT. → true on success."
+    (/= 0 (sb-alien:alien-funcall
+           (sb-alien:extern-alien "SetHandleInformation"
+                                  (function sb-alien:int sb-alien:system-area-pointer
+                                            (sb-alien:unsigned 32) (sb-alien:unsigned 32)))
+           (sb-sys:int-sap handle) +handle-flag-inherit+
+           (if inheritable +handle-flag-inherit+ 0)))))
+
+(defun %call-with-private-std-handles (specs thunk)
+  "Call THUNK (it starts one child). SPECS: the child's :input, :output and
+:error-output arguments. Windows (SBCL): this image's standard handles that
+the child does not take (see above) are not inheritable while THUNK runs.
+Elsewhere: just THUNK."
+  (declare (ignorable specs))
+  #+(and sbcl (or win32 windows))
+  (if (some #'streamp specs)
+      (funcall thunk)
+      (sb-thread:with-recursive-lock (*std-handle-lock*)
+        (let* ((handles (loop for i below 3 collect (%std-handle i)))
+               (kept (loop for h in handles for spec in specs
+                           when (and h (%std-spec-inherited-p spec)) collect h))
+               (cleared '()))
+          (unwind-protect
+               (progn
+                 (dolist (h handles)
+                   (when (and h
+                              (not (member h kept))
+                              (not (member h cleared))
+                              (member (%file-type h) '(1 3))
+                              (%inheritable-p h)
+                              (%set-inheritable h nil))
+                     (push h cleared)))
+                 (funcall thunk))
+            (dolist (h cleared)
+              (%set-inheritable h t))))))
+  #-(and sbcl (or win32 windows))
+  (funcall thunk))
+
+(defmacro with-private-std-handles ((&rest specs) &body body)
+  `(%call-with-private-std-handles (list ,@specs) (lambda () ,@body)))
+
 (defun %kill-child (handle force)
   (uiop:terminate-process (handle-info handle) :urgent force))
 
@@ -448,16 +546,19 @@ signals PROCESS-TIMEOUT-ERROR + CONTINUE each time it expires."
                               (car (push (%temp-file "process-out") (car temps)))))
                   (err-file (when (and err-kind (not pipes))
                               (car (push (%temp-file "process-err") (car temps)))))
-                  (info (handler-case
-                            (apply #'uiop:launch-program cmd
-                                   :input in
-                                   :output (if (and pipes out-kind) :stream out-file)
-                                   :error-output (if (and pipes err-kind) :stream err-file)
-                                   (append (when pipes
-                                             (list :element-type '(unsigned-byte 8)))
-                                           (when directory (list :directory directory))
-                                           env-keys))
-                          (error (c) (%wrap command "cannot run program" c))))
+                  (info (let ((out-spec (if (and pipes out-kind) :stream out-file))
+                              (err-spec (if (and pipes err-kind) :stream err-file)))
+                          (handler-case
+                              (with-private-std-handles (in out-spec err-spec)
+                                (apply #'uiop:launch-program cmd
+                                       :input in
+                                       :output out-spec
+                                       :error-output err-spec
+                                       (append (when pipes
+                                                 (list :element-type '(unsigned-byte 8)))
+                                               (when directory (list :directory directory))
+                                               env-keys)))
+                            (error (c) (%wrap command "cannot run program" c)))))
                   ;; Drain before anything can block: a full pipe stalls the child.
                   (out-drain (when pipes (%start-drain (uiop:process-info-output info))))
                   (err-drain (when pipes (%start-drain (uiop:process-info-error-output info)))))
@@ -493,14 +594,18 @@ signals PROCESS-TIMEOUT-ERROR + CONTINUE each time it expires."
       (%make-handle
        command
        (handler-case
-           (apply #'uiop:launch-program cmd
-                  :input (or input :stream)
-                  :output (or output :stream)
-                  :error-output (or error-output :stream)
-                  :element-type element-type
-                  :external-format external-format
-                  (append (when directory (list :directory directory))
-                          env-keys))
+           (let ((in (or input :stream))
+                 (out (or output :stream))
+                 (err (or error-output :stream)))
+             (with-private-std-handles (in out err)
+               (apply #'uiop:launch-program cmd
+                      :input in
+                      :output out
+                      :error-output err
+                      :element-type element-type
+                      :external-format external-format
+                      (append (when directory (list :directory directory))
+                              env-keys))))
          (error (c) (%wrap command "cannot run program" c)))
        process-group))))
 
