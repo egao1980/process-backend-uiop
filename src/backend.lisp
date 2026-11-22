@@ -288,15 +288,96 @@ through a temp file (pushed on the TEMPS cell) so nothing is decoded."
       (stream (temp (%stream-octets input encoding)))
       (t input))))
 
-(defun %capture (path kind encoding command)
+(defun %decode (octets kind encoding command)
+  "Captured OCTETS as KIND: NIL → empty octets, :OCTETS → OCTETS, :STRING → decoded."
   (ecase kind
     ((nil) (%empty-octets))
-    (:octets (%read-octets path))
+    (:octets octets)
     (:string
-     (let ((octets (%read-octets path)))
-       (handler-case (babel:octets-to-string octets :encoding encoding)
-         (babel-encodings:character-decoding-error (c)
-           (%wrap command (format nil "cannot decode output as ~a" encoding) c)))))))
+     (handler-case (babel:octets-to-string octets :encoding encoding)
+       (babel-encodings:character-decoding-error (c)
+         (%wrap command (format nil "cannot decode output as ~a" encoding) c))))))
+
+(defun %capture (path kind encoding command)
+  (%decode (if kind (%read-octets path) (%empty-octets)) kind encoding command))
+
+;;; Pipe capture
+;;;
+;;; With threads (SBCL :SB-THREAD), RUN captures stdout / stderr through pipes,
+;;; one drain thread per pipe, not through temp files: a sandboxed child
+;;; (macOS Seatbelt) may be denied fstat(2) on a regular file it inherited but
+;;; did not open, and macOS cat(1) exits on that (egao1980/compute-backend-seatbelt#2).
+;;; A pipe has no path to deny. Without threads, temp files as before.
+
+(defun %pipe-capture-p ()
+  #+sb-thread t
+  #-sb-thread nil)
+
+(defun %drain-octets (stream)
+  "Read STREAM to EOF, close it. → the octets, or the error that stopped the read."
+  (handler-case
+      (unwind-protect
+           (let ((chunks '())
+                 (total 0))
+             (loop (let* ((buf (make-array 65536 :element-type '(unsigned-byte 8)))
+                          (n (read-sequence buf stream)))
+                     (when (zerop n) (return))
+                     (push (if (= n (length buf)) buf (subseq buf 0 n)) chunks)
+                     (incf total n)))
+             (let ((out (make-array total :element-type '(unsigned-byte 8)))
+                   (start 0))
+               (dolist (chunk (nreverse chunks) out)
+                 (replace out chunk :start1 start)
+                 (incf start (length chunk)))))
+        (ignore-errors (close stream)))
+    (error (c) c)))
+
+(defun %start-drain (stream)
+  "A thread draining STREAM (%DRAIN-OCTETS), or NIL when STREAM is NIL."
+  (when stream
+    #+sb-thread
+    (sb-thread:make-thread #'%drain-octets :name "process-backend-uiop drain"
+                                           :arguments (list stream))
+    #-sb-thread
+    (error "pipe capture needs threads")))
+
+(defun %drain-done-p (thread)
+  #+sb-thread (not (sb-thread:thread-alive-p thread))
+  #-sb-thread (declare (ignore thread)) #-sb-thread t)
+
+(defun %join-drain (thread handle timeout command)
+  "THREAD's octets (empty for NIL). Waits for EOF: every writer of the pipe (the
+child and any descendant that kept it) has closed it. With TIMEOUT, polls and
+signals PROCESS-TIMEOUT-ERROR + CONTINUE each time it expires."
+  (if (null thread)
+      (%empty-octets)
+      (let ((result
+              #+sb-thread
+              (if (null timeout)
+                  (sb-thread:join-thread thread :default nil)
+                  (loop
+                    (let ((deadline (+ (get-internal-real-time)
+                                       (ceiling (* timeout internal-time-units-per-second))))
+                          (pause 0.001))
+                      (loop until (or (%drain-done-p thread)
+                                      (>= (get-internal-real-time) deadline))
+                            do (sleep pause)
+                               (setf pause (min 0.05 (* pause 2))))
+                      (when (%drain-done-p thread)
+                        (return (sb-thread:join-thread thread :default nil)))
+                      (restart-case
+                          (error 'process-protocol:process-timeout-error
+                                 :command (handle-command handle) :timeout timeout
+                                 :process handle)
+                        (continue ()
+                          :report (lambda (s)
+                                    (format s "Wait another ~a seconds for the output." timeout))
+                          nil)))))
+              #-sb-thread nil))
+        (typecase result
+          (octets result)
+          (condition (%wrap command "cannot read output" result))
+          (t (%wrap command "cannot read output" "the drain thread did not finish"))))))
 
 ;;; Waiting
 
@@ -356,29 +437,46 @@ through a temp file (pushed on the TEMPS cell) so nothing is decoded."
                          (error-output-p (process-protocol:normalize-capture error-output :error-output))
                          (error-p (process-protocol:normalize-capture error :error))
                          (t :octets)))
+         (pipes (%pipe-capture-p))
          (temps (list '()))
          (handle nil)
          (finished nil))
     (multiple-value-bind (cmd env-keys) (%command-and-env command shell env env-mode)
       (unwind-protect
-           (let ((in (%input-file input encoding temps))
-                 (out-file (when out-kind (car (push (%temp-file "process-out") (car temps)))))
-                 (err-file (when err-kind (car (push (%temp-file "process-err") (car temps))))))
-             (setf handle
-                   (%make-handle
-                    command
-                    (handler-case
-                        (apply #'uiop:launch-program cmd
-                               :input in :output out-file :error-output err-file
-                               (append (when directory (list :directory directory))
-                                       env-keys))
-                      (error (c) (%wrap command "cannot run program" c)))
-                    process-group))
+           (let* ((in (%input-file input encoding temps))
+                  (out-file (when (and out-kind (not pipes))
+                              (car (push (%temp-file "process-out") (car temps)))))
+                  (err-file (when (and err-kind (not pipes))
+                              (car (push (%temp-file "process-err") (car temps)))))
+                  (info (handler-case
+                            (apply #'uiop:launch-program cmd
+                                   :input in
+                                   :output (if (and pipes out-kind) :stream out-file)
+                                   :error-output (if (and pipes err-kind) :stream err-file)
+                                   (append (when pipes
+                                             (list :element-type '(unsigned-byte 8)))
+                                           (when directory (list :directory directory))
+                                           env-keys))
+                          (error (c) (%wrap command "cannot run program" c))))
+                  ;; Drain before anything can block: a full pipe stalls the child.
+                  (out-drain (when pipes (%start-drain (uiop:process-info-output info))))
+                  (err-drain (when pipes (%start-drain (uiop:process-info-error-output info)))))
+             (setf handle (%make-handle command info process-group))
              (let ((code (%wait handle timeout)))
-               (setf finished t)
-               (values code
-                       (%capture out-file out-kind encoding command)
-                       (%capture err-file err-kind encoding command))))
+               (if pipes
+                   (let ((out (%join-drain out-drain handle timeout command))
+                         (err (%join-drain err-drain handle timeout command)))
+                     (setf finished t)
+                     (values code
+                             (%decode out out-kind encoding command)
+                             (%decode err err-kind encoding command)))
+                   (progn
+                     (setf finished t)
+                     (values code
+                             (%capture out-file out-kind encoding command)
+                             (%capture err-file err-kind encoding command))))))
+        ;; Leaving early (timeout, unwind) kills the child (its tree with
+        ;; :PROCESS-GROUP T), which closes the pipes: the drain threads end.
         (when (and handle (not finished))
           (%kill-and-reap handle))
         (mapc #'uiop:delete-file-if-exists (car temps))))))

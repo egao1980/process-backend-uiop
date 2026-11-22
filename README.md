@@ -9,7 +9,7 @@ UIOP backend for [`process-protocol`](https://github.com/egao1980/process-protoc
 
 ## How it maps the protocol (0.3.0)
 
-- **`run`** launches the child with stdin / stdout / stderr on temp files and reads them back as bytes: output is exact (`:octets`, default) or decoded only when `:output :string` asks. Input strings are encoded with `:external-format` (`:utf-8`); octet input is written as is.
+- **`run`** feeds stdin from a temp file and captures stdout / stderr as bytes: output is exact (`:octets`, default) or decoded only when `:output :string` asks. Input strings are encoded with `:external-format` (`:utf-8`); octet input is written as is. With threads (SBCL `:sb-thread`) stdout and stderr are **pipes**, each drained by its own thread, so the child never sees a regular file it did not open (a sandboxed child may be denied `fstat` on one: macOS Seatbelt, where `cat` then fails — [compute-backend-seatbelt#2](https://github.com/egao1980/compute-backend-seatbelt/issues/2)). `run` returns once the child exited **and** both pipes reached EOF, so a background descendant that keeps stdout open keeps `run` waiting (as `$(…)` in a shell); `:timeout` bounds that wait too (`process-timeout-error`, `continue` waits another `:timeout`; leaving kills the child, its tree with `:process-group t`). Without threads: temp files, read back after the child exits.
 - **`:env`** is merged into the inherited environment (`sb-ext:posix-environ` on SBCL, then `:environment`). `:env-mode :replace` passes `:env` alone. Program lookup uses the parent's `PATH`. Other Unix Lisps get the same semantics through `/usr/bin/env [-i] [-u NAME] NAME=VALUE … cmd`; on Windows non-SBCL Lisps `:env` signals `process-error`.
 - **`launch :element-type :octets`** asks UIOP for `(unsigned-byte 8)` pipes. SBCL's pipes are bivalent: `read-byte` / `read-sequence` on octet vectors work, `stream-element-type` still says `character`.
 - **`:timeout`** polls the child. On expiry: `process-timeout-error` with a `continue` restart (wait another `:timeout`). `run` kills (`SIGKILL` / `TerminateProcess`) and reaps the child on any other exit; `wait` leaves it running.
@@ -19,7 +19,7 @@ UIOP backend for [`process-protocol`](https://github.com/egao1980/process-protoc
 - **`run :process-group t :timeout n`**: leaving `run` early (timeout, unwind) SIGKILLs the group / terminates the job (`taskkill /T` fallback), then reaps the child.
 - **`pid`**: `uiop:process-info-pid`, cached at launch. `supports-p`: `:pid` always, `:process-group` on SBCL and on Windows.
 
-OCI: `ghcr.io/egao1980/cl-systems/process-backend-uiop:0.3.1`
+OCI: `ghcr.io/egao1980/cl-systems/process-backend-uiop:0.3.2`
 
 ## License
 

@@ -277,3 +277,30 @@ under bash."
           (ok (equal "1|inherited" (via-wrapper '(("FOO" . "1")) :merge)))
           (ok (equal "1|" (via-wrapper (list '("FOO" . "1") (cons *probe* nil)) :merge)))
           (ok (equal "1|" (via-wrapper '(("FOO" . "1") ("PATH" . "/usr/bin:/bin")) :replace)))))))
+
+;;; Pipe capture (egao1980/compute-backend-seatbelt#2)
+
+#-(or win32 windows)
+(deftest run-captures-through-pipes
+  ;; With threads, RUN's stdout and stderr are pipes, not temp files: a
+  ;; sandboxed child may not stat a regular file it did not open.
+  (with-programs ("sh" "test")
+    (if (process-backend-uiop::%pipe-capture-p)
+        (multiple-value-bind (code out err)
+            (process-protocol:run '("sh" "-c" "test -p /dev/stdout && echo out-pipe; test -p /dev/stderr && echo err-pipe >&2")
+                                  :output :string :error-output :string)
+          (ok (zerop code))
+          (ok (equal (format nil "out-pipe~%") out))
+          (ok (equal (format nil "err-pipe~%") err)))
+        (skip "no threads: temp-file capture"))))
+
+(deftest run-large-output-both-streams
+  ;; Both pipes are drained at once: neither fills up and stalls the child.
+  (with-programs ("sh")
+    (multiple-value-bind (code out err)
+        (process-protocol:run
+         '("sh" "-c" "i=0; while [ $i -lt 2000 ]; do echo 0123456789012345678901234567890123456789012345678901234567890123456789; echo e0123456789012345678901234567890123456789012345678901234567890123456789 >&2; i=$((i+1)); done")
+         :timeout 60)
+      (ok (zerop code))
+      (ok (= (* 2000 71) (length out)))
+      (ok (= (* 2000 72) (length err))))))
